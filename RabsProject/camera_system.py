@@ -20,20 +20,19 @@ logging.getLogger('ultralytics').setLevel(logging.WARNING)
 from vidgear.gears import CamGear
 from RabsProject.logger import logging
 from RabsProject.exception import RabsException
-# from RabsProject.mongodb import MongoDBHandlerSaving  
+from RabsProject.mongodb import MongoDBHandlerSaving  
 from RabsProject.mon import MongoDBHandlerSaving  
 from RabsProject.send_email import EmailSender
 from RabsProject.utils import save_snapshot, send_data_to_dashboard
 
 frame_queues = {}
-MAX_QUEUE_SIZE = 30  # Adjust based on memory constraints and desired buffering
+MAX_QUEUE_SIZE = 30  
 
-motion_buffer_duration = 5  # Duration before and after motion
+motion_buffer_duration = 5  
 moton_buffer_fps = 25
 fourcc = cv2.VideoWriter_fourcc(*'mp4v')
 motion_frame_buffer = deque(maxlen=moton_buffer_fps * motion_buffer_duration)  
 recording_after_detection = False
-# ResurveTime = os.getenv("RESURVE_TIME")
 ResurveTime = float(os.getenv("RESURVE_TIME", "10"))
 
 
@@ -1262,9 +1261,231 @@ class SingleCameraSystemTruck:
 
 
 
+####################################################################################################################
+                            ## Opencv GPU Streaming Fire  Detection ##
+####################################################################################################################
 
-####################################################################################################################
-                                                ## END ##
-####################################################################################################################
+
+
+
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+# from Opencv_cuda.gpumat_tensor.utils.memory_repr_pytorch import opencv_gpu_mat_as_pytorch_tensor
+# from Opencv_cuda.gpumat_tensor.utils.memory_repr_pytorch import *
+import torch.cuda
+from RabsProject.utils.memory_repr_pytorch import opencv_gpu_mat_as_pytorch_tensor
+
+
+
+
+
+class CameraStreamGPU:
+    def __init__(self, rtsp_url: str, camera_id: int):
+        self.rtsp_url = rtsp_url
+        self.camera_id = camera_id
+        self.frame = None
+        self.stopped = False
+
+        params = cv2.cudacodec.VideoReaderInitParams()
+        params.targetSz = (640, 640)
+        params.minNumDecodeSurfaces = 10
+
+        self.video_reader = cv2.cudacodec.createVideoReader(self.rtsp_url, params=params)
+        self.video_reader.set(cv2.cudacodec.COLOR_FORMAT_BGR)
+
+    def start(self) -> 'CameraStreamGPU':
+        self.thread = Thread(target=self._update, daemon=True)
+        self.thread.start()
+        return self
+
+    def _update(self) -> None:
+        while not self.stopped:
+            ret, gpu_frame = self.video_reader.nextFrame()
+            if ret:
+                self.frame = gpu_frame
+            time.sleep(0.01)
+
+    def read(self) -> tuple[bool, Optional[Any]]:
+        return (self.frame is not None), self.frame
+
+    def stop(self) -> None:
+        self.stopped = True
+        if hasattr(self, 'thread'):
+            self.thread.join(timeout=1.0)
+        del self.video_reader
+
+
+class MultiCameraSystemGPU:
+    try:
+        def __init__(self, email: str, model_path:str, category:str):
+            self.email = email
+            self.model_path = model_path
+            self.category = category
+            self.camera_processors = {}
+            self.is_running = False
+            self.mongo_handler = MongoDBHandlerSaving()
+            self.last_frames = {}
+            self._initialize_cameras()
+
+
+        def _initialize_cameras(self) -> None:
+            camera_data = self.mongo_handler.fetch_camera_rtsp_by_email_and_category(email = self.email, category = self.category)
+
+            if not camera_data:
+                logging.error(f"No camera data found for email: {self.email} and {self.category}")
+                return
+
+            for camera in camera_data:
+                try:
+                    camera_id = camera["camera_id"]
+                    rtsp_link = camera["rtsp_link"]
+
+                    processor = CameraProcessorGPU(
+                        camera_id, rtsp_link, self.model_path,
+                        category=self.category)
+                        
+                    processor.stream.start()
+                    self.camera_processors[camera_id] = processor
+                    self.last_frames[camera_id] = None
+                    logging.info(f"Camera {camera_id}: Initialized successfully from MongoDB")
+                except RabsException as e:
+                    logging.error(f"Camera {camera_id}: Initialization failed: {str(e)}")
+
+        def get_video_frames(self):
+            """Generator function to yield video frames as bytes for HTTP streaming"""
+            logging.info("Streaming multi-camera video frames")
+
+            grid_cols = ceil(sqrt(len(self.camera_processors)))
+            grid_rows = ceil(len(self.camera_processors) / grid_cols)
+            blank_frame = np.zeros((240, 320, 3), dtype=np.uint8)
+
+            while True:
+                frames = []
+                for camera_id, processor in self.camera_processors.items():
+                    if processor.stream.stopped:
+                        continue
+                    
+                    ret, frame = processor.stream.read()
+                    if ret:
+                        processed_frame, _ = processor.process_frame(frame)
+                        self.last_frames[camera_id] = processed_frame
+                    else:
+                        processed_frame = self.last_frames.get(camera_id, blank_frame)
+
+                    frame_resized = cv2.resize(processed_frame, (320, 240))
+                    frames.append(frame_resized)
+
+                if frames:
+                    while len(frames) < grid_rows * grid_cols:
+                        frames.append(blank_frame)
+
+                    rows = [np.hstack(frames[i * grid_cols:(i + 1) * grid_cols]) for i in range(grid_rows)]
+                    grid_display = np.vstack(rows)
+
+                    _, buffer = cv2.imencode(".jpg", grid_display)
+                    yield (b"--frame\r\n"
+                        b"Content-Type: image/jpeg\r\n\r\n" +
+                        buffer.tobytes() + b"\r\n")
+
+                time.sleep(0.05)  # Small delay to control FPS
+
+        def start(self):
+            self.is_running = True
+            try:
+                while self.is_running:
+                    for processor in self.camera_processors.values():
+                        if not processor.stream.stopped:
+                            ret, frame = processor.stream.read()
+                            if ret:
+                                processor.process_frame(frame)
+                    time.sleep(0.1)
+            except KeyboardInterrupt:
+                self.stop()
+
+        def stop(self) -> None:
+            """Stop the camera system"""
+            self.is_running = False
+            for processor in self.camera_processors.values():
+                processor.stream.stop()
+            cv2.destroyAllWindows()
+            logging.info("Camera system stopped")
+
+    except Exception as e:
+        raise RabsException(e, sys) from e
+
+
+class CameraProcessorGPU:
+    def __init__(self, camera_id: int, rtsp_url: str, model_path: str, category:str):
+        self.camera_id = camera_id
+        self.rtsp_url = rtsp_url
+        self.category   = category
+        
+        self.stream = CameraStreamGPU(rtsp_url, camera_id)
+        self.window_name = f'Camera {self.camera_id}'
+        self.last_motion_time = None
+        self.motion_frame_buffer = deque(maxlen=100)  # Buffer for motion frames
+        self.recording_after_detection = False
+        self.recording_end_time = None
+        self.fourcc = cv2.VideoWriter_fourcc(*'XVID')  # Properly define fourcc
+        self._initialize_model(model_path)
+
+    def _initialize_model(self, model_path: str) -> None:
+        try:
+            self.model = YOLO(model_path)
+            logging.info(f"Camera {self.camera_id}: Model initialized successfully")
+        except Exception as e:
+            logging.error(f"Camera {self.camera_id}: Model initialization failed: {str(e)}")
+            raise
+
+    def process_frame(self, gpu_frame) -> tuple[np.ndarray, bool]:
+        try:
+            tensor_frame = opencv_gpu_mat_as_pytorch_tensor(gpu_frame)
+            tensor_frame = tensor_frame.to(dtype=torch.float32) / 255.0
+            tensor_frame = tensor_frame.permute(2, 0, 1).unsqueeze(0).contiguous()
+
+            results = self.model.predict(
+                source=tensor_frame,
+                device=0,
+                verbose=False,
+                task='obb',
+            )
+
+            result = results[0]
+            annotated_frame = result.plot(im_gpu='Tensor')
+            if isinstance(annotated_frame, torch.Tensor):
+                annotated_frame = annotated_frame.permute(1, 2, 0).cpu().numpy()
+
+            detected = False
+
+            if result.obb is not None:
+                for i in range(len(result.obb.xywhr)):
+                    x, y, w, h, angle = result.obb.xywhr[i].cpu().numpy()
+                    cls = int(result.obb.cls[i].item())
+                    conf = float(result.obb.conf[i].item())
+
+                    if cls == 0:
+                        detected = True
+
+            if detected:
+                self.current_time = datetime.now()
+                if self.last_motion_time is None or (self.current_time - self.last_motion_time).total_seconds() > ResurveTime:
+                    self.last_motion_time = self.current_time
+                    snapshot_path = save_snapshot(frame=annotated_frame, camera_id=self.camera_id, category=self.category)
+                    thread = threading.Thread(
+                        target=send_data_to_dashboard,
+                        args=(snapshot_path, self.current_time, self.camera_id, self.category))
+                    thread.start()
+
+            return annotated_frame, detected
+
+        except Exception as e:
+            logging.error(f"Camera {self.camera_id}: Frame processing error: {str(e)}")
+            return None, False
+
+
+# ####################################################################################################################
+#                                                 ## END ##
+# ####################################################################################################################
+
+
 
 
